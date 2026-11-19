@@ -87,6 +87,10 @@ def _ask_verifier(lic_path: str) -> dict:
     if not resp.get("ok"):
         raise PermissionError(resp.get("code", "E_UNKNOWN"))
 
+    # 响应必须回带本次请求的 nonce，防止重放旧的合法响应
+    if str(resp.get("nonce", "")) != nonce.hex():
+        raise PermissionError("E_TAG")
+
     body = {k: v for k, v in resp.items() if k != "sig"}
     try:
         ok = crypto.ed25519_verify(
