@@ -1,0 +1,19 @@
+# 私密数据（密钥、卡密、payload）—— 开源前直接删掉整个目录即可
+temp/
+# 卡密绝不允许进仓库
+*.lic
+
+# 安装测试目录（曾误提交过卡密和 payload）
+installer/_test/
+
+# 构建产物
+dist/
+build_nuitka/
+build/
+installer/output/
+*.log
+nuitka-crash-report.xml
+
+# Python
+__pycache__/
+*.pyc
