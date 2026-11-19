@@ -11,7 +11,7 @@
         print(f"授权失败: {content}") # content 是错误码
 
 直接用现成的这个客户端时：
-    有卡密 → 验证通过后进入 game.py 的数字炸弹
+    有卡密 → 验证通过后进入 protected_program.py 的示例程序
     没卡密 → 显示激活菜单（生成请求码 / 导入卡密）
 
 authorize() 内部做了三层验证：
@@ -184,8 +184,8 @@ def _run(lic_path: str) -> int:
         print(f"[拒绝] {CODE_HINT.get(result, result)}")
         return 1
     print("[通过] 授权有效")
-    import game
-    game.run(result)
+    import protected_program
+    protected_program.run(result)
     return 0
 
 

@@ -46,7 +46,7 @@
 | **高层** | `verifier.py` | 独立验证进程：读状态 → 验卡密 → 更新状态 → 签响应 | crypto、ipc、machine_key、state_store、lic_token、winops |
 | **高层** | `activation.py` | 激活流程：生成请求码、导入卡密、定位卡密文件 | crypto、lic_token、machine_key、runtime、winops |
 | **高层** | `app.py` | 客户端主程序 + `authorize()` 接口 + 激活菜单 | activation、crypto、ipc、lic_token、winops |
-| **高层** | `game.py` | 示例业务（数字炸弹），授权通过后才被调用 | 标准库 |
+| **高层** | `protected_program.py` | 被保护的示例程序（数字猜谜），授权通过后才被调用 | 标准库 |
 | **高层** | `reset.py` | 解除程序：生成请求码 / 消费重置令牌 | crypto、state_store、lic_token、winops |
 | **高层** | `keygen.py` | 厂商工具：init / mid / issue / sign-verifier / unlock-token / info | crypto、lic_token、winops |
 | **高层** | `sign.py` | 交互式签发工具，内部调用 `keygen.py issue` | lic_token |
