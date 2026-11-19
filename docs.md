@@ -331,6 +331,9 @@ python keygen.py init
 python build.py
 
 # 2. 打安装包（可选，见 installer/setup.iss）
+#    发布前必须改 setup.iss 顶部的 AppVersion（当前 2.0.0）；
+#    安装包文件名会自动变成 Setup_LicGuard_v<版本>.exe。
+#    AppId 不要改，否则升级会被当成另一个软件。
 
 # 3. 客户装好后第一次运行 → 看到激活菜单
 #    客户选 1 → 生成 REQ1（含 mid + msig + menc）→ 发给厂商

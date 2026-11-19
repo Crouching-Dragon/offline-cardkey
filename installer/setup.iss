@@ -7,10 +7,13 @@
 ;   3. 按 Ctrl+F9 编译，产物在 installer\output\ 下
 ;
 ; 想改产品名 / 版本号，改下面三行 #define 就行。
+; 注意：每次发布新版本都必须改 AppVersion（当前 2.0.0），
+;       安装包文件名会自动变成 Setup_LicGuard_v<版本>.exe。
+;       AppId 生成一次后就不要再改，否则会被当成两个不同的软件。
 ; ============================================================
 
 #define AppName "本地安全密码"
-#define AppVersion "1.0.0"
+#define AppVersion "2.0.0"
 #define AppPublisher "你的名字"
 
 [Setup]
