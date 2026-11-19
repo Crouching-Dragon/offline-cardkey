@@ -82,37 +82,62 @@ def cmd_mid(_args) -> None:
 # issue
 # ================================================================
 
+def _valid_mid(mid: str) -> bool:
+    return len(mid) == 64 and all(c in "0123456789abcdef" for c in mid)
+
+
+def _valid_pub_b64(value: str) -> bool:
+    try:
+        return len(crypto.b64d(value)) == 32
+    except Exception:
+        return False
+
+
 def cmd_issue(args) -> None:
     priv = _load_priv(args.key)
     ck = open(CONTENT_PATH, "rb").read()
 
-    # 两种签发方式：直接给机器码，或者丢一段客户发来的 REQ1 请求码
+    if args.days < 0 or args.runs < 0:
+        sys.exit("--days / --runs 不能为负数")
+
+    # 推荐用 REQ1：客户机器会把自己的两把公钥一起带过来
     if args.request:
         try:
-            req, _, _ = tk.parse_token(args.request, "REQ1")
-            mid = str(req["mid"]).lower()
-        except (tk.TokenError, KeyError) as e:
+            req, _, _ = tk.parse_token(args.request, "REQ1", parts_required=2)
+        except tk.TokenError as e:
             sys.exit(f"请求码格式错: {e}")
+        mid = str(req.get("mid", "")).lower()
+        msig = str(req.get("msig", ""))
+        menc = str(req.get("menc", ""))
     else:
         mid = args.mid.strip().lower()
+        msig = (args.msig or "").strip()
+        menc = (args.menc or "").strip()
+
+    if not _valid_mid(mid):
+        sys.exit("机器码必须是 64 位十六进制")
+    if not _valid_pub_b64(msig) or not _valid_pub_b64(menc):
+        sys.exit("缺少或非法的机器公钥：请让客户发 REQ1 请求码，或手动提供 --msig / --menc")
 
     payload = {
-        "v": 1,
+        "v": 2,
         "lid": secrets.token_hex(8),
         "mid": mid,
+        "msig": msig,
+        "menc": menc,
         "iat": int(time.time()),
         "exp": int(time.time()) + args.days * 86400 if args.days else 0,
         "runs": args.runs,
         "feat": ["pro"],
-        "ck": tk.wrap_content_key(ck, mid),
     }
+    payload.update(tk.wrap_content_key(ck, menc))
     lic = tk.sign_token(payload, "LIC1", priv)
 
     out = args.out or os.path.join(TEMP, "license.lic")
     _ensure_temp()
     with open(out, "w", encoding="utf-8") as f:
         f.write(lic)
-    print(f"已签发 {out}  lid={payload['lid']}  mid={mid[:12]}…  days={args.days}  runs={args.runs or '不限'}")
+    print(f"已签发 {out}  lid={payload['lid']}  mid={mid[:12]}…  msig={msig[:10]}…  days={args.days}  runs={args.runs or '不限'}")
 
 
 # ================================================================
@@ -136,28 +161,34 @@ def cmd_sign_verifier(args) -> None:
 def cmd_unlock_token(args) -> None:
     priv = _load_priv()
 
+    state_digest = ""
     if args.request:
         try:
-            payload, _, _ = tk.parse_token(args.request, "REQ1")
-            mid = payload["mid"]
-            mode = args.mode or payload.get("mode", "unlock")
+            req, _, _ = tk.parse_token(args.request, "REQ1", parts_required=2)
+            mid = str(req.get("mid", "")).lower()
+            mode = args.mode or req.get("mode", "unlock")
+            state_digest = str(req.get("state_digest", ""))
         except tk.TokenError as e:
             sys.exit(f"请求码格式错: {e}")
     else:
         mid = args.mid.strip().lower()
         mode = args.mode or "unlock"
 
+    if not _valid_mid(mid):
+        sys.exit("机器码必须是 64 位十六进制")
     if mode not in ("unlock", "attempts", "full"):
         sys.exit("mode 必须是 unlock / attempts / full")
 
     payload = {
-        "v": 1,
+        "v": 2,
         "mid": mid,
         "mode": mode,
         "iat": int(time.time()),
-        "exp": int(time.time()) + (args.ttl or 3600) if args.ttl else 0,
+        "exp": int(time.time()) + args.ttl if args.ttl else 0,
         "nonce": crypto.b64e(secrets.token_bytes(12)),
     }
+    if state_digest:
+        payload["state_digest"] = state_digest
     token = tk.sign_token(payload, "ULK1", priv)
 
     if args.out:
@@ -166,6 +197,8 @@ def cmd_unlock_token(args) -> None:
     else:
         print(token)
     print(f"  mid={mid}  mode={mode}  ttl={args.ttl or '永不过期'}s")
+    if not state_digest:
+        print("  [注意] 未绑定状态摘要，此令牌可被重复使用；优先用 --request 签发")
 
 
 # ================================================================
@@ -197,7 +230,9 @@ def main() -> None:
     s = sub.add_parser("issue")
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--mid", help="客户的机器码")
-    g.add_argument("--request", help="客户发来的 REQ1 请求码")
+    g.add_argument("--request", help="客户发来的 REQ1 请求码（推荐）")
+    s.add_argument("--msig", help="客户的 Ed25519 公钥（手动签发时需要）")
+    s.add_argument("--menc", help="客户的 X25519 公钥（手动签发时需要）")
     s.add_argument("--days", type=int, default=30)
     s.add_argument("--runs", type=int, default=0)
     s.add_argument("--out", help="默认写到 temp/license.lic")
@@ -211,8 +246,8 @@ def main() -> None:
     s = sub.add_parser("unlock-token")
     s.add_argument("--mid")
     s.add_argument("--request")
-    s.add_argument("--mode", default="unlock", choices=["unlock", "attempts", "full"])
-    s.add_argument("--ttl", type=int, default=0)
+    s.add_argument("--mode", default=None, choices=["unlock", "attempts", "full"])
+    s.add_argument("--ttl", type=int, default=3600)
     s.add_argument("--out")
     s.set_defaults(func=cmd_unlock_token)
 

@@ -1,99 +1,131 @@
-"""中层：卡密 + 重置令牌 + 机器码绑定。
+"""中层：卡密 + 重置令牌 + 机器绑定（协议 v2）。
 
 统一处理三种令牌格式：
   LIC1.<payload_b64>.<sig_b64>   —— 签发的卡密（Ed25519 签）
   ULK1.<payload_b64>.<sig_b64>   —— 签发的重置令牌（Ed25519 签）
   REQ1.<payload_b64>             —— 客户发给厂商的请求码（无签名）
 
-机器码派生 wrap_key 的逻辑也在这里统一放，keygen 和 verifier/app 都调用同一个函数。
+机器绑定（v2）：客户首次运行时生成一对 X25519 密钥（私钥由 DPAPI 保护），
+REQ1 把公钥带给厂商；厂商签发卡密时用这把公钥封装 content_key。
+换机器 / 换 Windows 用户 → 私钥不同 → AES-GCM 解不开，且卡密里没有任何
+可以用来复现私钥的公开数据。
 """
 import json
 import secrets
 import time
 
 import crypto
-import winops
 
+# 封装参数（换版本时改这里即可让旧格式自然失效）
+WRAP_SALT = b"lic-wrap-v2"
+WRAP_INFO = b"content-key"
+WRAP_AAD = b"ck-wrap-v2"
 
-# ================================================================
-# 机器码绑定 —— 派生 wrap_key
-# ================================================================
+MAX_TOKEN_CHARS = 65536
 
-def wrap_key_for(machine_id_hex: str) -> bytes:
-    """由机器码派生包裹密钥。
-
-    keygen 在签发卡密时用它把内容密钥 AES-GCM 加密塞进 ck 字段；
-    verifier 在验证时用它解包 ck；
-    换机器 → HKDF 输出不同 → AES-GCM 认证标签不匹配 → ck 解不开。
-    """
-    return crypto.hkdf(bytes.fromhex(machine_id_hex), b"lic-wrap-v1", b"content-key")
-
-
-def wrap_content_key(content_key: bytes, machine_id_hex: str) -> str:
-    """厂商侧：把内容密钥包装成可塞进卡密的 b64 字符串。"""
-    nonce = secrets.token_bytes(12)
-    ct = crypto.aes_gcm_encrypt(wrap_key_for(machine_id_hex), content_key, nonce, b"ck-wrap")
-    return crypto.b64e(nonce + ct)
-
-
-def unwrap_content_key(ck_b64: str, machine_id_hex: str) -> bytes:
-    """客户端侧：解开卡密里的内容密钥。
-
-    失败原因（都是 AES-GCM InvalidTag）：
-      * 机器码不匹配（最常见）
-      * ck 字段被篡改
-      * aad 不匹配
-    """
-    blob = crypto.b64d(ck_b64)
-    nonce, ct = blob[:12], blob[12:]
-    return crypto.aes_gcm_decrypt(wrap_key_for(machine_id_hex), ct, nonce, b"ck-wrap")
-
-
-# ================================================================
-# 统一的令牌解析
-# 三种格式都是 "<前缀>.<payload_b64>[.<sig_b64>]"，结构一致。
-# ================================================================
 
 class TokenError(Exception):
     """令牌解析/验签失败时抛的统一异常。"""
     pass
 
 
-def parse_token(text: str, expected_prefix: str) -> tuple[dict, bytes, bytes | None]:
+# ================================================================
+# 机器绑定 —— 用机器 X25519 公钥封装 content_key
+# ================================================================
+
+def wrap_content_key(content_key: bytes, machine_pub_b64: str) -> dict:
+    """厂商侧：把内容密钥封装给某台机器的 X25519 公钥。
+
+    返回 {"epk": 临时公钥, "ck": nonce||密文}，两个字段都进签名 payload。
+    私钥只存在于客户机器的 DPAPI 里，厂商也不需要知道。
+    """
+    try:
+        machine_pub = crypto.b64d(machine_pub_b64)
+    except Exception:
+        raise TokenError("机器公钥不是合法 base64")
+    if len(machine_pub) != 32:
+        raise TokenError("机器公钥长度不对")
+
+    eph_priv, eph_pub = crypto.x25519_keygen()
+    shared = crypto.x25519_exchange(eph_priv, machine_pub)
+    key = crypto.hkdf(shared, WRAP_SALT, WRAP_INFO)
+    nonce = secrets.token_bytes(12)
+    ct = crypto.aes_gcm_encrypt(key, content_key, nonce, WRAP_AAD)
+    return {"epk": crypto.b64e(eph_pub), "ck": crypto.b64e(nonce + ct)}
+
+
+def unwrap_content_key(payload: dict, machine_enc_priv: bytes) -> bytes:
+    """客户端侧：用本机 X25519 私钥解开卡密里的 content_key。
+
+    失败都是 AES-GCM InvalidTag：机器公钥不匹配、ck/epk 被改、aad 不对。
+    """
+    try:
+        epk = crypto.b64d(str(payload.get("epk", "")))
+        blob = crypto.b64d(str(payload.get("ck", "")))
+    except Exception:
+        raise TokenError("卡密缺少机器封装数据")
+    if len(epk) != 32 or len(blob) < 12 + 16:
+        raise TokenError("卡密缺少机器封装数据")
+
+    shared = crypto.x25519_exchange(machine_enc_priv, epk)
+    key = crypto.hkdf(shared, WRAP_SALT, WRAP_INFO)
+    return crypto.aes_gcm_decrypt(key, blob[12:], blob[:12], WRAP_AAD)
+
+
+# ================================================================
+# 统一的令牌解析
+# ================================================================
+
+def parse_token(text: str, expected_prefix: str,
+                parts_required: int | None = None) -> tuple[dict, bytes, bytes | None]:
     """拆分令牌 → (payload_dict, payload_raw_bytes, signature_or_None)。
 
-    REQ1 只有两段，返回 (payload, raw, None)；
-    LIC1 / ULK1 三段都有，返回 (payload, raw, sig_bytes)。
-    格式不对直接抛 TokenError。
+    REQ1 只有两段；LIC1 / ULK1 必须三段。格式不对直接抛 TokenError。
     """
+    if not isinstance(text, str) or len(text) > MAX_TOKEN_CHARS:
+        raise TokenError("令牌格式错")
     parts = text.strip().split(".")
     if not parts or parts[0] != expected_prefix:
         raise TokenError("格式不匹配")
+    if len(parts) not in (2, 3):
+        raise TokenError("格式不匹配")
+    if parts_required is not None and len(parts) != parts_required:
+        raise TokenError("格式不匹配")
 
-    payload_raw = crypto.b64d(parts[1])
+    try:
+        payload_raw = crypto.b64d(parts[1])
+    except Exception:
+        raise TokenError("payload 不是合法 base64")
+    if len(payload_raw) > 16384:
+        raise TokenError("payload 过大")
     try:
         payload = json.loads(payload_raw.decode())
     except Exception as e:
         raise TokenError(f"payload 不是合法 JSON: {e}")
+    if not isinstance(payload, dict):
+        raise TokenError("payload 不是对象")
 
     sig = None
-    if len(parts) >= 3:
+    if len(parts) == 3:
         try:
             sig = crypto.b64d(parts[2])
         except Exception:
             raise TokenError("签名字段不是合法 base64")
+        if len(sig) != 64:
+            raise TokenError("签名长度不对")
     return payload, payload_raw, sig
 
 
 def verify_signed_token(text: str, expected_prefix: str, public_key_b64: str) -> dict:
-    """解析 + 验签 + 可选过期检查。返回 payload dict。
+    """解析 + 验签 + 过期检查。返回 payload dict。
 
     验签失败 / 格式错 / 过期 → 统一抛 TokenError。
     """
-    payload, raw, sig = parse_token(text, expected_prefix)
-    if sig is None:
-        raise TokenError("缺少签名字段")
-    pub = crypto.b64d(public_key_b64)
+    payload, raw, sig = parse_token(text, expected_prefix, parts_required=3)
+    try:
+        pub = crypto.b64d(public_key_b64)
+    except Exception:
+        raise TokenError("厂商公钥损坏")
     if not crypto.ed25519_verify(pub, sig, raw):
         raise TokenError("签名无效")
     exp = int(payload.get("exp", 0) or 0)
@@ -113,20 +145,32 @@ def sign_token(payload: dict, prefix: str, private_key_bytes: bytes) -> str:
 # LIC1 卡密（客户端侧）
 # ================================================================
 
-def verify_license(text: str, mid: str, public_key_b64: str) -> tuple[dict, bytes]:
+def verify_license(text: str, mid: str, machine_enc_priv: bytes,
+                   vendor_pub_b64: str, machine_sign_pub_b64: str) -> tuple[dict, bytes]:
     """验一张卡密 → (payload_dict, 解开的内容密钥)。
 
-    四层检查：
-      ① Ed25519 验 payload 签名
-      ② 过期时间
-      ③ 机器码绑定（解 ck，失败即机器不匹配）
+    五层检查：
+      ① Ed25519 验 payload 签名（厂商私钥）
+      ② payload 版本必须是 v2
+      ③ 过期时间
+      ④ 卡密里的 mid / msig 与本机一致
+      ⑤ 用本机 X25519 私钥解 ck（换机器/换用户即失败）
     次数限制由调用方自己做（要读 StateStore）。
     """
-    payload = verify_signed_token(text, "LIC1", public_key_b64)
-    exp = int(payload.get("exp", 0) or 0)
-    if exp and int(time.time()) > exp:
-        raise TokenError("E_EXPIRED")
-    ck = unwrap_content_key(payload["ck"], mid)
+    payload = verify_signed_token(text, "LIC1", vendor_pub_b64)
+    if int(payload.get("v", 0) or 0) != 2:
+        raise TokenError("不支持的卡密版本")
+    if str(payload.get("mid", "")).lower() != str(mid).lower():
+        raise TokenError("机器码不匹配")
+    if str(payload.get("msig", "")) != machine_sign_pub_b64:
+        raise TokenError("本机密钥不匹配")
+    try:
+        ck = unwrap_content_key(payload, machine_enc_priv)
+    except TokenError:
+        raise
+    except Exception:
+        # AES-GCM InvalidTag：机器公钥不匹配 / ck 被改
+        raise TokenError("机器码不匹配")
     return payload, ck
 
 
@@ -137,7 +181,7 @@ def verify_license(text: str, mid: str, public_key_b64: str) -> tuple[dict, byte
 def verify_unlock_token(text: str, public_key_b64: str, mid: str) -> dict:
     """验一张重置令牌 → payload dict。"""
     payload = verify_signed_token(text, "ULK1", public_key_b64)
-    if payload.get("mid") != mid:
+    if str(payload.get("mid", "")).lower() != str(mid).lower():
         raise TokenError("机器码不匹配")
     if payload.get("mode") not in ("unlock", "attempts", "full"):
         raise TokenError("非法 mode")

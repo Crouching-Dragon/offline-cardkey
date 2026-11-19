@@ -10,6 +10,8 @@
 import ctypes
 import os
 import sys
+import time
+from contextlib import contextmanager
 from ctypes import wintypes
 
 import crypto  # 只用 sha256_hex，底层模块之间无循环依赖
@@ -175,6 +177,65 @@ def ads_delete(file_path: str, stream_name: str) -> bool:
 
 
 # ================================================================
+# DPAPI —— 用当前 Windows 用户 + 本机绑定加密
+# 文件被复制到别的机器或别的用户下就解不开。
+# ================================================================
+
+CRYPTPROTECT_UI_FORBIDDEN = 0x01
+
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _blob_in(data: bytes):
+    """构造入参 DATA_BLOB，返回 (blob, 用于保活的缓冲区)。"""
+    buf = ctypes.create_string_buffer(data, len(data))
+    return _DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), buf
+
+
+def _free_blob(blob: "_DATA_BLOB") -> bytes:
+    try:
+        return ctypes.string_at(blob.pbData, blob.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(blob.pbData, ctypes.c_void_p))
+
+
+def dpapi_protect(data: bytes, entropy: bytes = b"") -> bytes | None:
+    """用 DPAPI 加密。失败（非 Windows / API 拒绝）返回 None。"""
+    if sys.platform != "win32" or not data:
+        return None
+    blob_in, _keep = _blob_in(data)
+    ent, _keep2 = _blob_in(entropy) if entropy else (None, None)
+    blob_out = _DATA_BLOB()
+    ok = ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(blob_in), None,
+        ctypes.byref(ent) if ent is not None else None,
+        None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out),
+    )
+    if not ok:
+        return None
+    return _free_blob(blob_out)
+
+
+def dpapi_unprotect(blob: bytes, entropy: bytes = b"") -> bytes | None:
+    """用 DPAPI 解密。失败返回 None。"""
+    if sys.platform != "win32" or not blob:
+        return None
+    blob_in, _keep = _blob_in(blob)
+    ent, _keep2 = _blob_in(entropy) if entropy else (None, None)
+    blob_out = _DATA_BLOB()
+    ok = ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None,
+        ctypes.byref(ent) if ent is not None else None,
+        None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out),
+    )
+    if not ok:
+        return None
+    return _free_blob(blob_out)
+
+
+# ================================================================
 # 普通文件读写
 # ================================================================
 
@@ -185,6 +246,27 @@ def file_write(path: str, data: bytes) -> bool:
             f.write(data)
         return True
     except OSError:
+        return False
+
+
+def file_write_atomic(path: str, data: bytes) -> bool:
+    """先写同目录临时文件再 os.replace，避免断电/崩溃留下半截文件。"""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         return False
 
 
@@ -202,3 +284,54 @@ def file_delete(path: str) -> bool:
         return True
     except OSError:
         return False
+
+
+# ================================================================
+# 跨进程文件锁
+# 状态是"读 → 改 → 写"，多个 verifier 同时跑会互相覆盖。
+# ================================================================
+
+@contextmanager
+def file_lock(path: str, timeout: float = 10.0):
+    """独占锁住 path 指向的锁文件。拿不到锁超时抛 TimeoutError。"""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    f = open(path, "a+b")
+    locked = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                f.write(b"\0")
+                f.flush()
+            deadline = time.time() + timeout
+            while True:
+                try:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.time() >= deadline:
+                        raise TimeoutError("等待文件锁超时")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            locked = True
+        yield
+    finally:
+        if locked:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        f.close()

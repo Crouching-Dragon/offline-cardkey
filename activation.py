@@ -19,6 +19,7 @@ import time
 
 import crypto
 import lic_token as tk
+import machine_key
 import runtime
 import winops
 from vendor_pub import VENDOR_PUBKEY_B64
@@ -57,10 +58,22 @@ def find_license(explicit: str | None = None) -> str | None:
 
 
 def make_request(mode: str = "activate") -> str:
-    """生成激活请求码，写入 temp/request.txt，同时返回字符串。"""
+    """生成激活请求码，写入 temp/request.txt，同时返回字符串。
+
+    msig / menc 是本机 Ed25519 / X25519 公钥：厂商签发时用 menc 封装内容密钥，
+    客户端用 msig 验 verifier 响应签名。私钥由 DPAPI 保护，不会离开本机。
+    """
+    try:
+        msig = machine_key.sign_public_b64()
+        menc = machine_key.enc_public_b64()
+    except RuntimeError as e:
+        raise RuntimeError(f"本机密钥不可用: {e}")
+
     payload = {
-        "v": 1,
+        "v": 2,
         "mid": winops.machine_id(),
+        "msig": msig,
+        "menc": menc,
         "mode": mode,
         "ts": int(time.time()),
         "nonce": secrets.token_hex(16),
@@ -73,7 +86,7 @@ def make_request(mode: str = "activate") -> str:
 def import_license(text: str) -> tuple[bool, str]:
     """导入卡密文本。
 
-    会先完整验一遍（签名 + 过期 + 机器绑定），通过了才落盘，
+    会先完整验一遍（签名 + 版本 + 过期 + 机器绑定），通过了才落盘，
     避免存进去一张用不了的卡密。
     返回 (是否成功, lid | 失败原因)。
     """
@@ -83,9 +96,16 @@ def import_license(text: str) -> tuple[bool, str]:
 
     mid = winops.machine_id()
     try:
-        payload, _ck = tk.verify_license(text, mid, VENDOR_PUBKEY_B64)
+        payload, _ck = tk.verify_license(
+            text, mid,
+            machine_key.enc_private(),
+            VENDOR_PUBKEY_B64,
+            machine_key.sign_public_b64(),
+        )
     except tk.TokenError as e:
         return False, str(e)
+    except RuntimeError as e:
+        return False, f"本机密钥不可用: {e}"
     except Exception:
         # verify_license 里 ck 解不开时抛的是 AES-GCM 的 InvalidTag
         return False, "卡密与本机不匹配（或内容已损坏）"

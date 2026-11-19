@@ -1,6 +1,10 @@
-# licguard 三层架构对接文档
+# licguard 三层架构对接文档（协议 v2）
 
-离线场景下的双进程卡密验证框架。主程序 (`app.exe`) 调用独立的验证进程 (`verifier.exe`)，后者用 Ed25519 验卡密签名、AES-GCM 做机器绑定、三副本状态防回滚，最终**只下发解密核心资源所需的密钥**，不下发 true/false。
+离线场景下的双进程卡密验证框架。主程序 (`app.exe`) 调用独立的验证进程 (`verifier.exe`)，后者用 Ed25519 验卡密签名、用**本机 X25519 密钥**做机器绑定、三副本状态防回滚，最终**只下发解密核心资源所需的密钥**，不下发 true/false。
+
+> **v2 与 v1 不兼容**：卡密格式、REQ1/响应协议、状态格式全部升级。
+> 旧卡密会被判"签名无效"；旧状态（`ST1` 前缀）会被自动丢弃，不会把用户锁死。
+> 升级后需要重新签发卡密。
 
 ## 架构分层（核心设计理念）
 
@@ -12,17 +16,17 @@
 │        reset.py / keygen.py）                 │
 │  只管业务流程："验卡密 → 更新状态 → 下发密钥" │
 ├──────────────────────────────────────────────┤
-│  中层：领域组件（state_store.py / lic_token.py）│
-│  只管一类事情：三副本状态 / 令牌解析+验签       │
+│  中层：领域组件（state_store.py / lic_token.py /│
+│        machine_key.py）                       │
+│  只管一类事情：三副本状态 / 令牌 / 本机密钥    │
 ├──────────────────────────────────────────────┤
 │  底层：工具函数（crypto.py / winops.py / ipc.py）│
-│  纯技术原语：加解密 / 注册表ADS / 管道通信      │
+│  纯技术原语：加解密 / DPAPI / 注册表ADS / 管道 │
 └──────────────────────────────────────────────┘
 ```
 
-**为什么这样分？** 你（0 基础用户）只需要看高层。底层那些 `ctypes.GetVolumeInformationW`、`os.remove + 覆盖兜底`、`CREATE_NO_WINDOW` flag 这些 Windows 脏活已经被封进函数里了，你永远不用碰。
-
 **依赖方向规则：**
+
 ```
 高层 → 中层 → 底层
          ↓        ↓
@@ -33,14 +37,15 @@
 
 | 层 | 文件 | 职责 | 依赖 |
 |----|------|------|------|
-| **底层** | `crypto.py` | 纯密码学原语（b64、HKDF、HMAC、AES-GCM、Ed25519、sha256） | 标准库 + cryptography |
-| **底层** | `winops.py` | Windows 脏活（机器码、注册表、NTFS ADS、文件读写） | ctypes、winreg、crypto |
+| **底层** | `crypto.py` | 纯密码学原语（b64、HKDF、HMAC、AES-GCM、Ed25519、X25519、sha256） | 标准库 + cryptography |
+| **底层** | `winops.py` | Windows 脏活（机器码、注册表、NTFS ADS、DPAPI、原子写、跨进程锁） | ctypes、winreg、crypto |
 | **底层** | `ipc.py` | 子进程管道通信（Popen + CREATE_NO_WINDOW） | subprocess |
-| **中层** | `state_store.py` | 三副本状态（文件+注册表+ADS）+ HMAC 完整性 + 取 max 合并 | crypto、winops |
-| **中层** | `lic_token.py` | 三种令牌（LIC1/ULK1/REQ1）解析+验签 + 机器码 wrap_key | crypto、winops |
-| **高层** | `verifier.py` | 独立验证进程：读状态 → 验卡密 → 更新状态 → 签响应 | crypto、ipc、state_store、lic_token、winops |
-| **高层** | `activation.py` | 激活流程：生成请求码、导入卡密、定位卡密文件 | crypto、lic_token、runtime、winops |
-| **高层** | `app.py` | 客户端主程序 + `authorize()` 接口 + 激活菜单 | activation、crypto、ipc、winops |
+| **中层** | `machine_key.py` | 本机密钥对（Ed25519 / X25519）+ DPAPI 封装 + 状态密钥派生 | crypto、winops |
+| **中层** | `state_store.py` | 三副本状态（文件+注册表+ADS）+ HMAC 完整性 + 取 max 合并 + 跨进程锁 | crypto、machine_key、winops |
+| **中层** | `lic_token.py` | 三种令牌（LIC1/ULK1/REQ1）解析+验签 + 机器公钥封装 ck | crypto |
+| **高层** | `verifier.py` | 独立验证进程：读状态 → 验卡密 → 更新状态 → 签响应 | crypto、ipc、machine_key、state_store、lic_token、winops |
+| **高层** | `activation.py` | 激活流程：生成请求码、导入卡密、定位卡密文件 | crypto、lic_token、machine_key、runtime、winops |
+| **高层** | `app.py` | 客户端主程序 + `authorize()` 接口 + 激活菜单 | activation、crypto、ipc、lic_token、winops |
 | **高层** | `game.py` | 示例业务（数字炸弹），授权通过后才被调用 | 标准库 |
 | **高层** | `reset.py` | 解除程序：生成请求码 / 消费重置令牌 | crypto、state_store、lic_token、winops |
 | **高层** | `keygen.py` | 厂商工具：init / mid / issue / sign-verifier / unlock-token / info | crypto、lic_token、winops |
@@ -62,7 +67,7 @@ if ok:
     # result 是解开的核心资源明文
     my_product.run_with(result)
 else:
-    # result 是错误码，比如 "E_EXPIRED"、"签名无效"
+    # result 是错误码或中文原因
     print(f"授权失败: {result}")
 ```
 
@@ -70,27 +75,26 @@ else:
 
 ## 威胁模型
 
+下表是 v2 的实际防护能力。它提高的是攻击成本，不是数学意义上的不可破。
+
 | # | 攻击手段 | 防御 |
 |---|---------|------|
-| 1 | 主程序里把 `if ok:` 改成 `if True` | verifier 只下发 ck 不下发布尔量；没有 ck 就没法解核心资源 |
-| 2 | 卡密拷贝到另一台机器 | ck 用机器码派生的 wrap_key 包裹，目标机器以外 AES-GCM 认证失败 |
-| 3 | 卡密 payload 被改、签了自己的 Ed25519 | 客户端只有公钥，没有私钥，签名伪造不了 |
-| 4 | 系统时间回拨 | 三副本 `last` 字段取最大值；`now + 容忍窗口 < last` 即判作弊 |
-| 5 | 删除状态文件/注册表/ADS 全部清零 | 三处必须同时还原；单点删不影响其他副本 |
-| 6 | 多次试错爆破卡密 | `attempts` 计数 + 指数退避锁定（60s → 120s → 240s → 封顶 3600s） |
-| 7 | verifier.exe 被替换成永远返回 ok 的桩 | app 启动前先验 verifier 的 Ed25519 签名；verifier 自己启动时也自验 |
-| 8 | hook verifier 返回值伪造响应 | nonce 挑战 + 用 ck 签响应体做 HMAC；攻击者没有 ck 算不出正确 tag |
+| 1 | 主程序里把 `if ok:` 改成 `if True` | verifier 只下发 ck；没有 ck 解不开 payload。伪造"成功响应"还需要本机私钥签名 |
+| 2 | 卡密拷贝到另一台机器/另一个 Windows 用户 | ck 用**该机器**的 X25519 公钥封装；机器私钥由 DPAPI 保护，换机器/换用户解不开 |
+| 3 | 卡密 payload 被改、签了自己的 Ed25519 | 客户端只有厂商公钥，签名伪造不了 |
+| 4 | 系统时间回拨 | 三副本 `last` 取最大值；锁定到期时间基于 `max(last, now)`，把时钟调回来也不会提前解锁 |
+| 5 | 删除状态文件/注册表/ADS | 三副本必须同时还原；单点删不影响其他副本。**三处全删仍会回到初始状态**（离线固有，见"已知限制"） |
+| 6 | 多次试错爆破卡密 | `attempts` 计数 + 指数退避锁定（60s → 120s → 240s → 封顶 3600s）；状态 HMAC 密钥由本机密钥派生，源码公开也伪造不了状态 |
+| 7 | verifier.exe 被替换成永远返回 ok 的桩 | app 启动前验 verifier 的厂商签名，verifier 自己启动时也自验；响应还必须由本机私钥签名，桩拿不到私钥 |
+| 8 | hook verifier 返回值伪造响应 | 响应由本机 Ed25519 私钥签名，私钥不在响应里；app 用卡密 payload 中（厂商签过的）`msig` 验签 |
 
 **明确不防的**：
-- 机器码逆向：现在用 Nuitka 编译成机器码，产物里没有 `.py` 源码，但专业逆向人员仍可用 IDA / x64dbg 分析。成本从"几分钟读懂源码"变成"几小时读懂汇编"。
+
+- 机器码逆向：Nuitka 编译成机器码，产物里没有 `.py` 源码，但专业逆向人员仍可用 IDA / x64dbg 分析。
 - 暴力穷举 ck（32 字节 AES 密钥，不可能）。
 - 用调试器 hook `app.authorize()` / `winops.machine_id()` 等函数返回假值。要防这个，核心逻辑得用 C/Rust + 反调试 + 虚拟机混淆。
-- **任何拿到一份有效卡密的人**：`mid` 明文写在 payload 里，`wrap_key_for(mid)` 的派生算法也是公开的，所以对方不需要厂商私钥、也不需要被授权的那台机器，就能解出 `content_key` 并解密 `payload.bin`。
-
-> **开源后请先读这段**：本仓库以源码形式公开，上表是"设计意图"，不是安全承诺。
-> 只要密钥或派生逻辑被写进客户端，它就不再是秘密。受此影响，第 2、4、5、6、8 条
-> 目前均可被绕过（状态 HMAC 主密钥、ck 派生、响应 tag 都依赖客户端里"应该保密"的东西）。
-> 修复方向见仓库 Issue。
+- **在已授权的机器上**：用户仍可读出 `content_key` 并解密 `payload.bin`。所有客户共用同一份 payload 和 content_key，所以一份解密结果可以传播；这是离线方案的固有上限。
+- 同一 Windows 用户下的恶意程序：可以调用 DPAPI 解封本机私钥，或直接读状态文件。DPAPI 挡的是"把文件拷到别的机器/别的用户"。
 
 ---
 
@@ -101,13 +105,13 @@ else:
 | 文件 | 作用 | 打包进 exe？ | 谁持有 |
 |------|------|------------|--------|
 | `keygen.py` | 厂商工具：init / mid / issue / sign-verifier / unlock-token / info | ❌ | 你 |
-| `temp/vendor.key` | Ed25519 私钥，32 字节 seed | ❌ | 你（命门） |
+| `temp/vendor.key` | Ed25519 私钥，32 字节 seed | ❌ | 你（命门，务必离线备份） |
 | `vendor_pub.py` | 由 init 自动生成，含 `VENDOR_PUBKEY_B64`，需要提交 | ✅ | 客户 |
 | `temp/content.key` | 32 字节固定内容密钥，init 时生成一次不再变 | ❌ | 你 |
 | `temp/payload.bin` | AES-GCM 加密后的核心资源（init 时生成） | ✅ | 客户 |
 | `build.py` | 一条命令 Nuitka 编译 + 签名流程 | ❌ | 你 |
 
-**所有私密文件都在 `temp/` 里**：`temp/` 已被 `.gitignore` 忽略，开源前直接删掉整个目录即可，不会残留任何密钥或卡密。目录被删了也没关系，`keygen.py` 和客户端用到时会自动重建。
+**所有私密文件都在 `temp/` 里**：`temp/` 已被 `.gitignore` 忽略；`*.lic` 和 `installer/_test/` 也被忽略，避免卡密误提交。
 
 ### 客户端运行时（dist/ 目录就是要发给客户的）
 
@@ -122,13 +126,15 @@ else:
 
 **必须整个 `dist/` 目录一起发**，只拷两个 exe 会启动失败。
 
-### 运行时状态（客户机器上，三处冗余）
+### 运行时状态（客户机器上）
 
 | 位置 | 路径 | 备注 |
 |------|------|------|
-| 文件 | `%LOCALAPPDATA%\OfflineLicGuard\state.bin` | 最容易被注意到 |
-| 注册表 | `HKCU\Software\OfflineLicGuard\s` | 普通用户不一定知道 |
-| NTFS ADS | `<verifier.exe>:licstate` | 杀软敏感、复制/解压会丢 |
+| 本机密钥 | `%LOCALAPPDATA%\OfflineLicGuard\machine.key` | DPAPI 封装的 32 字节种子；换机器/用户解不开 |
+| 文件 | `%LOCALAPPDATA%\OfflineLicGuard\state.bin` | 三副本之一，`ST2` 格式 |
+| 注册表 | `HKCU\Software\OfflineLicGuard\s` | 三副本之二 |
+| NTFS ADS | `<verifier.exe>:licstate` | 三副本之三；杀软敏感、复制/解压会丢 |
+| 锁文件 | `%LOCALAPPDATA%\OfflineLicGuard\state.lock` | 跨进程互斥，防止并发绕过次数限制 |
 
 ---
 
@@ -141,94 +147,99 @@ else:
      │     读 verifier.exe 算 SHA-256 → 读 verifier.exe.sig → Ed25519 公钥验签
      │     失败 → 返回 E_VERIFIER_INVALID，退出
      │
-     ├─ ② 生成 32 字节 nonce
+     ├─ ② 读卡密 → 验厂商签名 → 取出 payload.msig（本机签名公钥）
      │
-     ├─ ③ ipc.run_request(verifier.exe, {"v":1, "nonce":"...", "lic":"<绝对路径>"})
-     │     Popen verifier.exe，stdin 写 JSON + \n 分隔，stdout 读最后一行
-     │     (CREATE_NO_WINDOW flag 永久焊死，不会弹黑窗)
+     ├─ ③ 生成 32 字节 nonce
+     │
+     ├─ ④ ipc.run_request(verifier.exe, {"v":2,"nonce":..., "lic":...})
      │
      ▼
   verifier.exe 启动
      │
      ├─ self_check() → 验自己的 SHA-256 签名
-     │     失败 → 输出 E_SELF
      │
-     ├─ StateStore.load() → 读三份副本 + HMAC 校验
+     ├─ 取状态锁（state.lock）
+     ├─ StateStore.load() → 读三份副本 + HMAC 校验（ST1 旧状态自动丢弃）
      │     有副本验不过 → E_TAMPER
      │     lock_until > now → E_LOCKED
      │     now + tolerance < last → E_CLOCK + 锁
      │
-     ├─ lic_token.verify_signed_token() → Ed25519 验 payload 签名
-     │     失败 → 签名无效
+     ├─ lic_token.verify_license()
+     │     ① Ed25519 验厂商签名 ② 版本/过期 ③ mid + msig 与本机一致
+     │     ④ 用本机 X25519 私钥解 ck（换机器即失败）
      │
-     ├─ lic_token.unwrap_content_key() → AES-GCM 解 ck（用 machine_id 派生的 wrap_key）
-     │     失败 → 机器码不匹配
+     ├─ 次数限制检查
+     ├─ StateStore.save()（原子写文件 + 注册表 + ADS）
      │
-     ├─ 过期 / 次数限制 → 已过期 / 次数耗尽
-     │
-     ├─ StateStore.save() → 三份副本（文件+注册表+ADS）
-     │
-     └─ 输出 {"ok":true, "ck":"...", "runs":..., "lim":..., "ts":..., "tag":"..."}
-          tag = HMAC(ck, nonce + canonical(resp_without_tag))
+     └─ 用本机 Ed25519 私钥签响应：
+          sig = Sign(seed, canonical({v, ok, ck, runs, lim, ts, nonce}))
      │
      ▼
   app.exe 读响应
      │
      ├─ 失败响应 → 按 code 映射为用户友好提示
-     │
-     ├─ HMAC 验 tag（用响应里的 ck + 请求里的 nonce 重算）
-     │     失败 → E_TAG
-     │
+     ├─ 用卡密里的 msig 验响应签名 → 失败返回 E_TAG
      └─ crypto.aes_gcm_decrypt(ck, payload.bin) → 核心资源明文
-          ck 不对 → InvalidTag，没任何有价值内容
 ```
 
 ---
 
-## 协议（v=1）
+## 协议（v=2）
 
 ### 请求
+
 ```json
 {
-  "v": 1,
+  "v": 2,
   "nonce": "abcdef...（32 字节随机数的 hex 字符串）",
   "lic": "C:\\path\\to\\license.lic"
 }
 ```
 
 ### 成功响应
+
 ```json
 {
-  "v": 1,
+  "v": 2,
   "ok": true,
   "ck": "<内容密钥 base64>",
   "runs": 3,
   "lim": 0,
   "ts": 1732740000,
-  "tag": "<HMAC-SHA256(ck, nonce + canonical({v,ok,ck,runs,lim,ts})) 的 base64>"
+  "nonce": "abcdef...",
+  "sig": "<Ed25519_本机私钥(canonical({v,ok,ck,runs,lim,ts,nonce})) 的 base64>"
 }
 ```
 
+`sig` 的私钥由 DPAPI 保护，响应体里没有。app 用卡密 payload 里的 `msig` 验签。
+
 ### 失败响应
+
 ```json
-{"v": 1, "ok": false, "code": "E_EXPIRED", "ts": 1732740000}
+{"v": 2, "ok": false, "code": "E_EXPIRED", "ts": 1732740000}
 ```
+
+失败响应不签名（只会导致拒绝，不授予权限）。
 
 错误码映射：
 
 | code | 含义 | 触发位置 |
 |------|------|---------|
 | E_SELF | verifier 自校验失败 | verifier.self_check() |
-| E_REQ | 请求格式错 / 协议版本不匹配 | verifier.main() |
+| E_REQ | 请求格式错 / 协议版本不匹配 / nonce 非法 | verifier.main() / handle() |
 | E_TAMPER | 状态有副本被改坏 | StateStore.load() |
 | E_LOCKED | 仍在锁定窗口内 | verifier.handle() |
-| E_CLOCK | 系统时间被回拨 | verifier.handle() |
+| E_CLOCK | 系统时间被回拨 | verifier.verify_and_update() |
 | E_LIC_READ | 卡密文件不存在或读不到 | verifier.handle() |
-| E_TAG | 主程序收到的响应 tag 对不上 | app._ask_verifier() |
+| E_RUNS | 次数耗尽 | verifier.verify_and_update() |
+| E_MACHINE_KEY | 本机密钥不可用（DPAPI 失败） | verifier.handle() |
+| E_BUSY | 状态锁等待超时 | verifier.handle() |
+| E_INTERNAL | 未预期异常 | verifier.handle() |
+| E_TAG | 主程序收到的响应签名对不上 | app._ask_verifier() |
 | E_VERIFIER_INVALID | verifier.exe 的 Ed25519 签名无效 | app._check_verifier_authentic() |
 | E_DECRYPT | payload.bin 解密失败 | app._load_core() |
 
-注意：卡密本身的签名/机器码/过期/次数错误是**中文消息**直接返回的（"签名无效"、"机器码不匹配"、"已过期"、"次数耗尽"），不是 E_XXX 格式。
+卡密本身的签名/机器码/过期错误是**中文消息**直接返回的（"签名无效"、"机器码不匹配"、"本机密钥不匹配"、"已过期"）。
 
 ---
 
@@ -237,52 +248,72 @@ else:
 顶层是 `LIC1.<payload_b64>.<Ed25519_signature_b64>`，三段。
 
 payload JSON：
+
 ```json
 {
-  "v": 1,
+  "v": 2,
   "lid": "0ba1b22692f48c69",
   "mid": "4dc5a1cb3e55e251...（64 位 hex 机器码）",
+  "msig": "<本机 Ed25519 公钥 base64>",
+  "menc": "<本机 X25519 公钥 base64>",
   "iat": 1732740000,
   "exp": 1797479947,
   "runs": 0,
   "feat": ["pro"],
-  "ck": "9-3vi4hKI7KYZD0sfLD98_fion..."
+  "epk": "<厂商临时 X25519 公钥 base64>",
+  "ck": "<nonce(12) || AES-GCM 密文 base64>"
 }
 ```
 
-其中 `ck` 字段是**内容密钥的密文**：
+`ck` 的生成：
+
 ```
-nonce(12字节) || AES-GCM(wrap_key_for(mid), content_key, aad="ck-wrap")
+shared = X25519(厂商临时私钥, menc)
+key    = HKDF(shared, "lic-wrap-v2", "content-key")
+ck     = nonce(12) || AES-GCM(key, content_key, aad="ck-wrap-v2")
 ```
 
-`wrap_key_for(mid)` = HKDF(bytes.fromhex(mid), "lic-wrap-v1", "content-key")
-
-`content_key` 就是 `content.key` 文件里的 32 字节，init 时生成一次就固定。**换机器** → HKDF 输出不同 → AES-GCM 认证标签不匹配 → ck 解不开。
+`content_key` 就是 `content.key` 文件里的 32 字节，init 时生成一次就固定。**换机器** → 本机 X25519 私钥不同 → shared 不同 → AES-GCM 认证失败 → ck 解不开。卡密里没有任何能推导出机器私钥的公开数据（v1 的 `mid` 派生方案已废弃）。
 
 签名 = `Ed25519_private_sign(crypto.canonical(payload))`。客户端只有公钥，没法伪造签名。
+
+### REQ1 请求码
+
+```json
+{
+  "v": 2,
+  "mid": "<机器码>",
+  "msig": "<本机 Ed25519 公钥>",
+  "menc": "<本机 X25519 公钥>",
+  "mode": "activate",
+  "ts": 1732740000,
+  "nonce": "<16 字节 hex>"
+}
+```
+
+`msig` / `menc` 来自本机 DPAPI 保护的种子，公钥可以公开。
 
 ---
 
 ## 状态字典字段
 
-三副本里存的就是这个 dict，HMAC 做完整性保护。
+三副本里存的就是这个 dict，HMAC 做完整性保护，前缀为 `ST2`（旧 `ST1` 会被忽略）。
 
 | 字段 | 类型 | 含义 |
 |------|------|------|
 | `lid` | str | 当前验证过的卡密唯一 ID |
 | `first` | int | 第一次验证成功的时间戳（秒） |
 | `last` | int | 三副本里见过的最大时间戳。`now + 容忍 < last` 即判回拨 |
-| `runtime` | int | 累计在线时长（秒）。当前版本只累加不减，可改成预算扣减模型 |
+| `runtime` | int | 累计在线时长（秒） |
 | `runs` | int | 累计运行次数。和卡密 `runs` 字段（上限）对比 |
-| `attempts` | int | 连续错误次数。达 MAX_ATTEMPTS_BEFORE_LOCK=3 后进入指数退避 |
-| `lock_until` | int | 临时锁定到期时间戳。在此之前所有请求直接拒 |
+| `attempts` | int | 连续错误次数。达 3 次后进入指数退避 |
+| `lock_until` | int | 临时锁定到期时间戳 |
 
-**合并规则**：三副本里每个整数字段取**最大值**。这样：
-- 攻击者把某副本的 `runs` 改小 → 取 max 仍是真实累计次数；
-- 攻击者把某副本的 `last` 改小 → 不影响回拨检测；
-- 把某个副本改成垃圾数据 → 那个副本的 HMAC 通不过 → `tampered=True` → E_TAMPER。
+**合并规则**：三副本里每个整数字段取**最大值**。改小任一副本都不影响结果；垃圾副本 HMAC 通不过 → `tampered=True` → E_TAMPER。
 
-**HMAC 密钥**：拆成三段 hex 写死在源码里，运行时异或还原，再 HKDF 派生成真正的 MAC key。防止 strings/grep 直接搜到完整密钥。
+**HMAC 密钥**：`HKDF(DPAPI 机器种子, "licguard-state-v2", "state-mac")`，不再写死在源码里。
+
+**并发与原子性**：verifier 在 `state.lock` 独占锁内完成 `load → 校验 → save`；状态文件用"临时文件 + fsync + os.replace"原子替换。
 
 ---
 
@@ -293,17 +324,16 @@ nonce(12字节) || AES-GCM(wrap_key_for(mid), content_key, aad="ck-wrap")
 cd licguard
 python keygen.py init
 # 生成 temp/vendor.key / vendor_pub.py / temp/content.key / temp/payload.bin
+# 请立刻离线备份 temp/vendor.key
 
 # === 每次给新客户发货 ===
 # 1. 编译客户端（默认不带卡密，客户装上是"未激活"状态）
 python build.py
-#    调试时加 --with-license 可把 temp/license.lic 一起带进 dist/temp
 
 # 2. 打安装包（可选，见 installer/setup.iss）
-#    发给客户的就是 installer/output/Setup_*.exe
 
 # 3. 客户装好后第一次运行 → 看到激活菜单
-#    客户选 1 → 生成 REQ1 请求码 → 发给厂商
+#    客户选 1 → 生成 REQ1（含 mid + msig + menc）→ 发给厂商
 
 # 4. 收到请求码后签发卡密
 python keygen.py issue --request "REQ1.xxx" --days 365 --runs 0
@@ -311,14 +341,15 @@ python keygen.py issue --request "REQ1.xxx" --days 365 --runs 0
 
 #    不想记参数就用交互式工具：
 python sign.py
-#    支持：粘贴请求码 / 选文件 / 直接输入机器码 / 更换私钥文件
-#    签完自动复制卡密到剪贴板
 
 # 5. 把卡密内容（或文件）发给客户
 #    客户在菜单里选 2 粘贴导入 → 进入使用
+```
 
-# 也可以跳过请求码，直接凭机器码签发：
-python keygen.py issue --mid 4dc5a1cb... --days 365 --runs 0
+**手动凭机器码签发**需要客户额外提供两把公钥（否则无法做机器绑定）：
+
+```bash
+python keygen.py issue --mid <64位hex> --msig <b64> --menc <b64> --days 365
 ```
 
 ### 客户首次激活流程（客户视角）
@@ -326,7 +357,7 @@ python keygen.py issue --mid 4dc5a1cb... --days 365 --runs 0
 ```
 双击 app.exe
    ↓
-没有卡密 → 显示菜单
+没有卡密 → 显示激活菜单
    1) 生成激活请求码（发给厂商）
    2) 导入厂商发回的卡密
    0) 退出
@@ -336,134 +367,147 @@ python keygen.py issue --mid 4dc5a1cb... --days 365 --runs 0
    ↓ 你跑 keygen.py issue --request ...，把卡密发回
    ↓ 客户选 2，粘贴卡密
 验证通过 → 写入 temp/license.lic → 进入程序
-下次启动直接读取 temp/license.lic，不再弹菜单
 ```
 
 **注意**：
-- 重建密钥（`keygen.py init --reset`）会让**所有已签发的卡密失效**——旧卡密的 Ed25519 签名验不过新私钥对应的公钥。
-- `build.py` 每次重新编译 verifier.exe 后会自动用 vendor.key 给它签名。**签完名的 exe 不能再改**——哪怕改一个字节，verifier 自己的 self_check 和 app 的 _check_verifier_authentic 都会过不了。
+
+- 重建密钥（`keygen.py init --reset`）会让**所有已签发的卡密失效**，需要重新编译并重新签发。
+- `build.py` 每次重新编译 verifier.exe 后会自动用 vendor.key 给它签名。**签完名的 exe 不能再改**。
 
 ---
 
 ## 解除锁定流程（reset.py + keygen.py unlock-token）
 
-客户那边被锁了（E_LOCKED / E_CLOCK / E_TAMPER），但你是合法厂商，可以用签名重置令牌来帮他解锁。
+`reset.py` 打包发给客户，**没有厂商私钥**，必须吃一张 `keygen.py unlock-token` 签好的 `ULK1` 令牌才能生效。
 
 ### 安全设计
 
-`reset.py`（和 app.py / verifier.py 一样打包发给客户）**没有厂商私钥**。所以它自身什么都做不了——必须吃一张由 `keygen.py unlock-token` 用厂商私钥签好的重置令牌（`ULK1.` 前缀）才能生效。这意味着：
-
-- 令牌只能在**绑定的那台机器**上用（mid 不匹配会被拒绝）；
-- 令牌可以带过期时间（`--ttl`），防止旧令牌被重复利用；
-- 令牌的 Ed25519 签名客户端只有公钥，伪造不了。
+- 令牌只能用在**绑定的那台机器**（mid 不匹配直接拒绝）；
+- `REQ1` 里带当前状态摘要，令牌会绑定它；**用过一次后状态变化，重放会被拒**；
+- 默认有效期 3600 秒（`--ttl 0` 才是永不过期）；
+- Ed25519 签名客户端伪造不了。
 
 ### 重置三种模式
 
 | 模式 | 清理内容 | 适用场景 |
 |------|---------|---------|
-| `unlock` | 只清 `lock_until` | 单纯因为系统时间被调了导致的临时锁定 |
-| `attempts` | 清 `attempts` + `lock_until` | 客户试了几次错卡密被锁定，允许再试 |
-| `full` | 三副本全部清空 | 状态被篡改（E_TAMPER），或者客户换了机器 |
+| `unlock` | 只清 `lock_until` | 系统时间被调导致的临时锁定 |
+| `attempts` | 清 `attempts` + `lock_until` | 多次输错卡密被锁定 |
+| `full` | 三副本全部清空 | 状态被篡改（E_TAMPER）或换了机器 |
 
 ### 客户侧（本机）
+
 ```bash
 python reset.py request --mode attempts
-# 输出会类似：
-# 重置请求码（发给厂商）：
 # REQ1.eyJtaWQiOiI0ZGM1YTFj...
-# 当前状态摘要：tampered=False  lock_until=1732740330  attempts=4
 ```
 
 ### 厂商侧（你这边）
-```bash
-# 吃客户发回来的请求码，签成正式重置令牌
-python keygen.py unlock-token --request REQ1.eyJtaWQiOiI...
 
-# 或者直接给 mid，跳过请求码这一步（不影响安全）
+```bash
+python keygen.py unlock-token --request REQ1.eyJtaWQiOiI...
+# 直接给 mid 也可以，但不会绑定状态摘要（可重放，仅建议应急）
 python keygen.py unlock-token --mid 4dc5a1cb... --mode attempts
 ```
 
 ### 客户侧（再发回）
+
 ```bash
-python reset.py apply --token ULK1.eyJleHAiOjAsImlhdCI6...
-# 输出：[成功] 已清 attempts + lock_until
+python reset.py apply --token ULK1.eyJleHAiOjAs...
 ```
 
-### tampered 状态降级
-
-如果 `StateStore.load()` 返回 `tampered=True`（三副本里有副本 HMAC 通不过），`reset.py` 会**忽略你指定的 mode**，直接把三个落点全部清空。理由：被篡改过的状态不可信，在它上面再做字段级修改只会让状态更混乱。
+如果检测到 `tampered=True`，`reset.py` 会忽略指定 mode，直接清空三副本。
 
 ---
 
-## 底层函数速查（方便以后自己改）
+## 底层函数速查
 
 ### crypto.py
+
 | 函数 | 做什么 |
 |------|--------|
-| `b64e(data)` / `b64d(text)` | URL-safe base64 编解码，自动处理 padding |
-| `canonical(obj)` | JSON 序列化成稳定字节串（key 排序、无空格、UTF-8），签名前必调 |
-| `hkdf(key, salt, info, length=32)` | HKDF-SHA256 密钥派生 |
-| `hmac_sha256(key, msg)` / `hmac_equals(a, b)` | HMAC-SHA256 + 常量时间比较 |
-| `aes_gcm_encrypt(key, pt, nonce, aad=b"")` / `aes_gcm_decrypt(...)` | AES-GCM 带认证的加解密 |
-| `ed25519_sign(priv, msg)` / `ed25519_verify(pub, sig, msg)` | Ed25519 签名验签（verify 返回 bool，不抛异常） |
-| `ed25519_keygen()` | 生成 (priv_32bytes, pub_32bytes) |
-| `sha256(data)` / `sha256_hex(data)` | SHA-256（字节版 / hex 版） |
+| `b64e` / `b64d` | URL-safe base64 编解码 |
+| `canonical(obj)` | 稳定 JSON 字节串（key 排序、无空格） |
+| `hkdf(key, salt, info, length=32)` | HKDF-SHA256 |
+| `hmac_sha256` / `hmac_equals` | HMAC + 常量时间比较 |
+| `aes_gcm_encrypt` / `aes_gcm_decrypt` | AES-GCM |
+| `ed25519_sign` / `ed25519_verify` | Ed25519 签名验签 |
+| `ed25519_public_from_private` | 由 seed 推导 Ed25519 公钥 |
+| `x25519_keygen` / `x25519_exchange` / `x25519_public_from_private` | X25519 ECDH |
+| `sha256` / `sha256_hex` | SHA-256 |
 
 ### winops.py
+
 | 函数 | 做什么 |
 |------|--------|
 | `machine_id()` | 64 位 hex 机器指纹（卷序列号 + MachineGuid 的 sha256） |
-| `reg_write(path, name, value)` / `reg_read(...)` / `reg_delete(...)` | HKCU\Software 下的注册表读写删 |
-| `ads_write(file, stream, data)` / `ads_read(...)` / `ads_delete(...)` | NTFS ADS 备用数据流读写删（delete 有覆盖兜底） |
-| `file_write/read/delete(path)` | 普通文件操作 |
+| `dpapi_protect` / `dpapi_unprotect` | 用当前 Windows 用户 + 本机绑定加解密 |
+| `file_write_atomic(path, data)` | 临时文件 + fsync + os.replace |
+| `file_lock(path, timeout)` | 跨进程独占锁（msvcrt.locking） |
+| `reg_write/read/delete` | HKCU\Software 下的注册表操作 |
+| `ads_write/read/delete` | NTFS ADS 读写删（delete 有覆盖兜底） |
+| `file_write/read/delete` | 普通文件操作 |
 
-### ipc.py
+### machine_key.py
+
 | 函数 | 做什么 |
 |------|--------|
-| `run_request(exe, request_dict, timeout=15)` | 启动子进程，stdin 发 JSON，stdout 收最后一行 JSON，自动 CREATE_NO_WINDOW |
-| `run_line(exe, stdin_text, timeout=15)` | 简单版：stdin 给文本，返回 stdout 全文 |
+| `seed()` | 读取/首次生成 32 字节种子（DPAPI 封装） |
+| `sign_public_b64()` / `enc_public_b64()` | 本机两把公钥（给 REQ1 / 响应验签用） |
+| `sign(data)` | 用本机 Ed25519 私钥给响应签名 |
+| `enc_private()` | 本机 X25519 私钥（解卡密里的 ck） |
+| `state_mac_key()` | 三副本 HMAC 密钥 |
+
+### ipc.py
+
+| 函数 | 做什么 |
+|------|--------|
+| `run_request(exe, dict, timeout=15)` | stdin 发 JSON，stdout 收最后一行 JSON，自动 CREATE_NO_WINDOW；输出上限 1 MB |
+| `run_line(exe, text, timeout=15)` | 简单版：stdin 给文本，返回 stdout 全文 |
 
 ---
 
-## 已知限制
+## 已知限制与残余风险
 
-### 1. 编译成机器码，挡得住反编译，挡不住逆向
+### 1. 离线内容最终可被提取
 
-现在用 Nuitka 把 Python 编译成 C 再编译成机器码，产物里没有 `.py` / `.pyc`：
+任何没联网的卡密系统，只要攻击者**拿到一份有效卡密并逆向**，最终都能解出内容。v2 把门槛从"改一个跳转"提高到"必须在已授权机器上、以授权用户身份运行并读 DPAPI"，但无法阻止这一点。
 
-| | PyInstaller（旧方案） | Nuitka（现在） |
-|---|---|---|
-| 产物内容 | 字节码 + 解释器 | 机器码 |
-| 还原源码 | pyinstxtractor 几分钟搞定 | 拿不到 |
-| 改逻辑 | 改 `.py` 重新打包 | 需要 patch 机器码 |
+### 2. 所有客户共用同一份 payload / content_key
 
-但这不等于"不可破"：`_master_secret()`、`machine_id()` 这类逻辑仍可被 IDA / x64dbg 定位，只是从"读懂 Python"变成"读懂汇编再打补丁"，成本高一个数量级。
+一份解密结果可以传播。若要限制影响面，需要给每个客户生成独立的 payload/content_key（发货时 license + payload 一起发），或把核心资源放到服务端。
 
-**继续加固的方向**：核心逻辑用 C/Rust 手写、加反调试、保持版本更新。
+### 3. 状态三副本仍可被全部删除
 
-### 2. 杀软误报
+删掉文件、注册表、ADS 三处，状态回到初始值，次数限制重置。这是离线状态存储的固有上限；三副本的作用是**提高发现和删除成本**，不是"防住"。
 
-Nuitka 输出的是常规 PE 文件 + 依赖 DLL，不再是自解压单文件，启发式误报会比 onefile 少。但下面这些行为仍可能触发检测：
-- 往 verifier.exe 写 ADS（NTFS 备用数据流）→ Defender/360 可能拦；
-- 写注册表 HKCU → 正常行为但叠加后更敏感；
-- 读系统盘卷序列号 → 也可能触发启发式。
+### 4. 同一用户下的恶意程序
 
-**缓解措施**：
-- 用 EV 代码签名证书签名 exe（最有效）；
-- 不要再给 dist 里的 exe 加 UPX 之类的壳；
-- 把 ADS 副本改成单独文件，降低被杀软标记为"可疑"的概率；
-- 上线前向微软安全响应中心和 360 提交误报申诉。
+DPAPI 保护的是"文件被拷到别的机器/用户"。如果攻击者已经能以授权用户身份运行代码，他可以解封机器私钥、读状态文件、hook 进程。要防这个需要 C/Rust + 反调试 + 代码签名 + 服务端校验。
 
-### 3. 离线场景最终可破
+### 5. 杀软误报
 
-任何没联网的卡密系统，攻击者只要**拿到一个有效卡密并能逆向**，最终都能破。能做的是把成本从"改一个跳转"抬到"必须手握一份有效卡密 + 逆向 verifier"。当前设计已经到后者的门槛。
+ADS、注册表、读卷序列号都可能触发启发式。建议用 EV 代码签名证书、不要加壳、必要时提交误报申诉。
 
-### 4. 状态三副本可被全部删除
+### 6. 状态写入的极端情况
 
-攻击者手动删掉三个落点（文件、注册表、ADS），状态就回到初始全 0。三副本的设计目的不是"防住"，而是让攻击者**必须同时找到并删除三个位置**——普通用户不一定知道 ADS 这回事。
+文件是原子写，但注册表和 ADS 不是。若断电发生在三副本写入之间，可能出现"一份新、两份旧"，取 max 合并通常能自愈；若某份被写坏，会判 E_TAMPER，需要重置令牌。
 
-如果卡密是"总运行次数"卖的，建议再加一层**用量预算**模型：签发卡密时就把可运行时长拆成若干"块"，每跑一次消耗一块，块的消耗记录写进状态三副本。这样就算状态全删、次数清零，**已消耗的块数也无法被补回**，因为块的签名写死在卡密 payload 里。
+### 7. 机器密钥丢失
 
-### 5. ADS 删除"假成功"的历史问题
+删除 `machine.key` 或换 Windows 用户等价于换机器：卡密需要重新签发，旧状态会被丢弃。请提前告知客户不要清理 `%LOCALAPPDATA%\OfflineLicGuard`。
 
-早期版本里 `os.remove()` 和 `DeleteFileW` 对 PyInstaller 打包的 exe 上的 ADS 会返回 True 但流实际还在。现在 `winops.ads_delete()` 里加了覆盖兜底——删不掉就用 `\x00` 覆盖 32 字节，上层 `StateStore.load()` 的 HMAC 校验会判定 tampered=True，自然触发重置。这个 bug 已修，留在文档里是为了万一以后要移植到别的打包器时别踩同样的坑。
+---
+
+## v1 → v2 变更摘要
+
+| 项目 | v1 | v2 |
+|------|----|----|
+| 机器绑定 | `HKDF(mid)`，mid 明文可推导 | X25519 ECDH + DPAPI 机器私钥 |
+| 响应认证 | `HMAC(ck, ...)`，ck 在响应里（自证循环） | 本机 Ed25519 签名，公钥来自卡密 |
+| 状态 HMAC 密钥 | 写死在源码（三段 XOR） | DPAPI 机器种子派生 |
+| 状态并发 | 无锁读改写 | `state.lock` 跨进程锁 |
+| 状态写入 | 直接覆盖 | 临时文件 + fsync + os.replace |
+| 状态格式 | `ST1` | `ST2`（ST1 自动丢弃） |
+| 重置令牌 | 可重放、默认可永不过期 | 绑定状态摘要、默认 3600s |
+| 解析健壮性 | b64/hex 异常可崩溃 | 统一 TokenError + 长度/格式校验 |

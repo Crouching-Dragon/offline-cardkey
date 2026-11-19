@@ -8,13 +8,15 @@
   ② HKCU\\Software\\OfflineLicGuard\\s             （注册表，base64）
   ③ <verifier.exe>:licstate                       （NTFS ADS）
 
-HMAC 主密钥拆成三段异或，避免完整字符串直接出现在源码里。
+HMAC 密钥由本机 DPAPI 保护的机器种子派生（machine_key.state_mac_key），
+不再写死在源码里——源码公开也不会让所有人共用一把状态密钥。
 """
 import json
 import os
 import sys
 
 import crypto
+import machine_key
 import winops
 
 
@@ -24,16 +26,15 @@ FILE_NAME = "state.bin"
 ADS_NAME = "licstate"
 
 
-def _master_secret() -> bytes:
-    """主密钥拆成三段异或，防 strings/grep 直接搜到完整值。"""
-    a = bytes.fromhex("7b1e9c04d5a2f8731c6e0b9d4a3f82e5")
-    b = bytes.fromhex("cd4a17e30b96f25d8c1a04e7b93d60af")
-    c = bytes.fromhex("b6508a9f2c1de74a5f03b69c8d2e417a")
-    return bytes(x ^ y ^ z for x, y, z in zip(a, b, c))
-
-
 def _state_mac_key() -> bytes:
-    return crypto.hkdf(_master_secret(), b"state-v1", b"state-mac")
+    """状态 HMAC 密钥：由 DPAPI 保护的机器种子派生，每个用户/机器不同。"""
+    return machine_key.state_mac_key()
+
+
+def digest(state: dict, tampered: bool) -> str:
+    """状态摘要。重置令牌绑定它，重复使用会因为状态已变而被拒。"""
+    body = crypto.canonical(state) + (b"|tampered" if tampered else b"|ok")
+    return crypto.sha256_hex(body)
 
 
 class StateStore:
@@ -66,12 +67,17 @@ class StateStore:
     # ---------------- 序列化 ----------------
 
     def _pack(self, state: dict) -> bytes:
-        body = b"ST1" + crypto.canonical(state)
+        body = b"ST2" + crypto.canonical(state)
         return body + crypto.hmac_sha256(_state_mac_key(), body)
 
     def _unpack(self, blob: bytes) -> dict | None:
         """验证 HMAC 后反序列化。失败返回 None。"""
-        if not blob or not blob.startswith(b"ST1") or len(blob) < 64:
+        if not blob or len(blob) < 64:
+            return None
+        if blob.startswith(b"ST1"):
+            # v2 之前的旧状态：密钥不同，直接丢弃（不当作篡改，避免升级就锁死）
+            return None
+        if not blob.startswith(b"ST2"):
             return None
         body, mac = blob[:-32], blob[-32:]
         expect = crypto.hmac_sha256(_state_mac_key(), body)
@@ -114,12 +120,14 @@ class StateStore:
         for blob in blobs:
             d = self._unpack(blob)
             if d is None:
-                tampered = True
+                # ST1 是旧版本状态，升级时静默丢弃；其他坏数据才算篡改
+                if not blob.startswith(b"ST1"):
+                    tampered = True
             else:
                 parsed.append(d)
 
         if not parsed:
-            return dict(self.DEFAULT), True
+            return dict(self.DEFAULT), tampered
 
         merged = {}
         for field in ("first", "last", "runtime", "runs", "attempts", "lock_until"):
@@ -133,7 +141,7 @@ class StateStore:
         """写三份副本。任何一份失败都静默跳过——多副本就是用来容忍单点故障的。"""
         blob = self._pack(state)
         os.makedirs(self.state_dir, exist_ok=True)
-        winops.file_write(self.file_path, blob)
+        winops.file_write_atomic(self.file_path, blob)
         winops.reg_write(REG_PATH, REG_NAME, crypto.b64e(blob))
         winops.ads_write(self.exe_path, ADS_NAME, blob)
 
@@ -143,3 +151,9 @@ class StateStore:
         winops.file_delete(self.file_path)
         winops.reg_delete(REG_PATH)
         winops.ads_delete(self.exe_path, ADS_NAME)
+
+    # ---------------- 并发控制 ----------------
+
+    def lock(self):
+        """跨进程独占锁：load → 校验 → save 必须包在同一个锁里。"""
+        return winops.file_lock(os.path.join(self.state_dir, "state.lock"))

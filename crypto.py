@@ -14,6 +14,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
@@ -97,8 +101,51 @@ def ed25519_verify(public_key_bytes: bytes, signature: bytes, message: bytes) ->
     try:
         Ed25519PublicKey.from_public_bytes(public_key_bytes).verify(signature, message)
         return True
-    except InvalidSignature:
+    except (InvalidSignature, ValueError, TypeError):
         return False
+
+
+def ed25519_public_from_private(private_key_bytes: bytes) -> bytes:
+    """由 32 字节私钥派生 Ed25519 公钥。"""
+    priv = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+    return priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+# ================================================================
+# X25519（椭圆曲线 Diffie-Hellman，用于把内容密钥封装给某台机器）
+# ================================================================
+
+def x25519_keygen() -> tuple[bytes, bytes]:
+    """生成一对 X25519 (私钥32字节, 公钥32字节)。"""
+    priv = X25519PrivateKey.generate()
+    priv_bytes = priv.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return priv_bytes, x25519_public_from_private(priv_bytes)
+
+
+def x25519_public_from_private(private_key_bytes: bytes) -> bytes:
+    """由 32 字节私钥派生 X25519 公钥。"""
+    priv = X25519PrivateKey.from_private_bytes(private_key_bytes)
+    return priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+def x25519_exchange(private_key_bytes: bytes, peer_public_key_bytes: bytes) -> bytes:
+    """X25519 计算共享密钥。低阶点会得到全零，必须拒绝。"""
+    priv = X25519PrivateKey.from_private_bytes(private_key_bytes)
+    peer = X25519PublicKey.from_public_bytes(peer_public_key_bytes)
+    shared = priv.exchange(peer)
+    if shared == b"\x00" * 32:
+        raise ValueError("无效的 X25519 共享密钥")
+    return shared
 
 
 def ed25519_keygen() -> tuple[bytes, bytes]:

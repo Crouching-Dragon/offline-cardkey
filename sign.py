@@ -57,11 +57,15 @@ def _pick_file(title: str) -> str | None:
         return None
 
 
-def _parse_request(text: str) -> str | None:
-    """从 REQ1 里取出机器码，格式不对返回 None。"""
+def _parse_request(text: str) -> dict | None:
+    """从 REQ1 里取出机器码和两把公钥，格式不对返回 None。"""
     try:
-        payload, _, _ = ltoken.parse_token((text or "").strip(), "REQ1")
-        return str(payload["mid"]).lower()
+        payload, _, _ = ltoken.parse_token((text or "").strip(), "REQ1", parts_required=2)
+        return {
+            "mid": str(payload.get("mid", "")).lower(),
+            "msig": str(payload.get("msig", "")),
+            "menc": str(payload.get("menc", "")),
+        }
     except Exception:
         return None
 
@@ -76,9 +80,10 @@ def _copy_to_clipboard(text: str) -> bool:
         return False
 
 
-def _issue_flow(mid: str, key_path: str) -> None:
+def _issue_flow(info: dict, key_path: str) -> None:
     print()
-    print(f" 已识别机器码：{mid}")
+    print(f" 已识别机器码：{info['mid']}")
+    print(f" 机器公钥：msig={info['msig'][:12]}…  menc={info['menc'][:12]}…")
     days = _ask(" 有效期天数（0=永久，默认 365）: ", "365")
     runs = _ask(" 启动次数（0=不限，默认 0）: ", "0")
     out = _ask(f" 输出文件（默认 temp{os.sep}license.lic，回车即可）: ", DEFAULT_OUT)
@@ -91,7 +96,10 @@ def _issue_flow(mid: str, key_path: str) -> None:
 
     cmd = [
         sys.executable, os.path.join(HERE, "keygen.py"), "issue",
-        "--mid", mid, "--days", days, "--runs", runs, "--out", out,
+        "--mid", info["mid"],
+        "--msig", info["msig"],
+        "--menc", info["menc"],
+        "--days", days, "--runs", runs, "--out", out,
     ]
     if os.path.abspath(key_path) != os.path.abspath(DEFAULT_KEY):
         cmd += ["--key", key_path]
@@ -160,11 +168,11 @@ def main() -> int:
         if choice == "1":
             print()
             text = _ask(" 粘贴请求码: ")
-            mid = _parse_request(text)
-            if mid is None:
+            info = _parse_request(text)
+            if info is None:
                 print(" [错误] 请求码格式不对，应该以 REQ1. 开头")
                 continue
-            _issue_flow(mid, key_path)
+            _issue_flow(info, key_path)
 
         elif choice == "2":
             path = _pick_file("选择请求码文件") or ""
@@ -178,11 +186,11 @@ def main() -> int:
             except OSError as e:
                 print(f" [错误] 读取失败: {e}")
                 continue
-            mid = _parse_request(text)
-            if mid is None:
+            info = _parse_request(text)
+            if info is None:
                 print(" [错误] 文件里不是合法的 REQ1 请求码")
                 continue
-            _issue_flow(mid, key_path)
+            _issue_flow(info, key_path)
 
         elif choice == "3":
             print()
@@ -190,7 +198,9 @@ def main() -> int:
             if len(mid) != 64 or any(c not in "0123456789abcdef" for c in mid):
                 print(" [错误] 机器码应该是 64 位十六进制")
                 continue
-            _issue_flow(mid, key_path)
+            msig = _ask(" 输入客户 Ed25519 公钥 msig（base64）: ").strip()
+            menc = _ask(" 输入客户 X25519 公钥 menc（base64）: ").strip()
+            _issue_flow({"mid": mid, "msig": msig, "menc": menc}, key_path)
 
         elif choice == "4":
             print()

@@ -17,7 +17,7 @@
 authorize() 内部做了三层验证：
   ① 启动前先验 verifier.exe 的厂商签名 → 防被替换成"永远返回 ok"的桩
   ② Popen verifier.exe，stdin 发请求（带 nonce 防重放）
-  ③ 验响应 HMAC tag，确认是真正的 verifier 签的
+  ③ 用卡密里的本机公钥验响应 Ed25519 签名
   ④ 用 ck 解密 payload.bin → 核心资源明文
 
 任何一步过不去都返回 (False, 错误码)。
@@ -29,6 +29,7 @@ import sys
 import activation
 import crypto
 import ipc
+import lic_token as tk
 import runtime
 import winops
 from vendor_pub import VENDOR_PUBKEY_B64
@@ -61,21 +62,41 @@ def _check_verifier_authentic(path: str) -> bool:
     )
 
 
+def _read_license_payload(lic_path: str) -> dict:
+    """读卡密并验厂商签名，返回 payload（含本机公钥 msig）。"""
+    try:
+        with open(lic_path, "r", encoding="utf-8") as f:
+            text = f.read(65536)
+    except OSError:
+        raise PermissionError("E_LIC_READ")
+    return tk.verify_signed_token(text, "LIC1", VENDOR_PUBKEY_B64)
+
+
 def _ask_verifier(lic_path: str) -> dict:
-    """Popen verifier，发请求，验响应 tag。"""
+    """Popen verifier，发请求，用卡密里的机器公钥验响应签名。"""
+    payload = _read_license_payload(lic_path)
+    sign_pub = str(payload.get("msig", ""))
+    if not sign_pub:
+        raise PermissionError("E_LIC_FORMAT")
+
     nonce = secrets.token_bytes(32)
     resp = ipc.run_request(
         verifier_executable(),
-        {"v": 1, "nonce": nonce.hex(), "lic": os.path.abspath(lic_path)},
+        {"v": 2, "nonce": nonce.hex(), "lic": os.path.abspath(lic_path)},
     )
     if not resp.get("ok"):
         raise PermissionError(resp.get("code", "E_UNKNOWN"))
 
-    ck = crypto.b64d(resp["ck"])
-    body = {k: v for k, v in resp.items() if k != "tag"}
-    expect = crypto.hmac_sha256(ck, nonce + crypto.canonical(body))
-    actual = crypto.b64d(resp["tag"])
-    if not crypto.hmac_equals(expect, actual):
+    body = {k: v for k, v in resp.items() if k != "sig"}
+    try:
+        ok = crypto.ed25519_verify(
+            crypto.b64d(sign_pub),
+            crypto.b64d(str(resp.get("sig", ""))),
+            crypto.canonical(body),
+        )
+    except Exception:
+        ok = False
+    if not ok:
         raise PermissionError("E_TAG")
     return resp
 
@@ -106,10 +127,10 @@ def authorize(lic_path: str) -> tuple[bool, str]:
         return False, "E_VERIFIER_INVALID"
     try:
         resp = _ask_verifier(lic_path)
-    except (PermissionError, RuntimeError) as e:
+    except (PermissionError, RuntimeError, tk.TokenError) as e:
         return False, str(e)
-    except Exception as e:
-        return False, f"E_INTERNAL:{e}"
+    except Exception:
+        return False, "E_INTERNAL"
     try:
         content = _load_core(crypto.b64d(resp["ck"]))
     except Exception:
@@ -123,6 +144,7 @@ def authorize(lic_path: str) -> tuple[bool, str]:
 
 CODE_HINT = {
     "E_LIC_FORMAT": "卡密格式错",
+    "E_LIC_READ": "卡密文件不存在或读不到",
     "E_LIC_SIG": "卡密签名无效",
     "E_MACHINE": "卡密与本机不匹配",
     "E_EXPIRED": "卡密已过期",
@@ -132,8 +154,12 @@ CODE_HINT = {
     "E_LOCKED": "已被锁定",
     "E_SELF": "verifier 自校验失败",
     "E_VERIFIER_INVALID": "verifier 签名无效",
-    "E_TAG": "响应 tag 校验失败",
+    "E_TAG": "响应签名校验失败",
     "E_DECRYPT": "核心资源解密失败",
+    "E_REQ": "请求格式错",
+    "E_MACHINE_KEY": "本机密钥不可用",
+    "E_BUSY": "验证进程忙，请稍后重试",
+    "E_INTERNAL": "内部错误",
 }
 
 
@@ -199,7 +225,11 @@ def _activation_menu() -> int:
             return 1
 
         if choice == "1":
-            token = activation.make_request()
+            try:
+                token = activation.make_request()
+            except RuntimeError as e:
+                print(f" [失败] {e}")
+                continue
             print()
             print(f" 请求码已保存到：{activation.request_path()}")
             print(" 把下面这一整行发给厂商：")

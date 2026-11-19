@@ -43,8 +43,13 @@ def run_request(executable: str, request: dict, timeout: int = 15) -> dict:
     lines = out.decode(errors="replace").strip().splitlines()
     if not lines:
         raise RuntimeError("子进程没有输出")
+    if len(out) > 1024 * 1024:
+        raise RuntimeError("子进程输出异常")
     # 取最后一行 JSON——前面可能混入 stderr 重定向或引导信息
-    return json.loads(lines[-1])
+    data = json.loads(lines[-1])
+    if not isinstance(data, dict):
+        raise RuntimeError("子进程响应格式错")
+    return data
 
 
 def run_line(executable: str, stdin_text: str = "", timeout: int = 15) -> str:

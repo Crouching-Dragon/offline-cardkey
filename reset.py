@@ -8,7 +8,6 @@
   --apply     消费厂商签好的 ULK1 令牌
 """
 import argparse
-import json
 import secrets
 import sys
 import time
@@ -24,13 +23,12 @@ def cmd_request(_args) -> None:
     """生成本机重置请求码，客户发给厂商。"""
     mid = winops.machine_id()
     store = ss.StateStore()
-    state, tampered = store.load()
-
-    body = json.dumps(state, sort_keys=True, ensure_ascii=False).encode()
-    digest = crypto.sha256_hex(body + (b"tampered" if tampered else b"ok"))
+    with store.lock():
+        state, tampered = store.load()
+        digest = ss.digest(state, tampered)
 
     payload = {
-        "v": 1,
+        "v": 2,
         "mid": mid,
         "mode": _args.mode or "unlock",
         "state_digest": digest,
@@ -62,25 +60,36 @@ def cmd_apply(args) -> None:
     mode = payload["mode"]
     store = ss.StateStore()
 
-    state, tampered = store.load()
+    try:
+        with store.lock():
+            state, tampered = store.load()
 
-    # tampered → 忽略 mode，直接全清
-    if tampered or mode == "full":
-        store.clear()  # 三副本全清（StateStore 内部已正确定位 verifier.exe 上的 ADS）
-        if tampered:
-            print("[注意] 检测到状态被篡改，已清空三副本")
-        else:
-            print("[成功] 已清空三副本状态（full 模式）")
-        return
+            # 令牌绑定申请时的状态摘要：用过一次后状态已变，重放会被拒
+            expected = payload.get("state_digest", "")
+            if expected and ss.digest(state, tampered) != expected:
+                print("[失败] 令牌已使用或本机状态已变化，请重新申请")
+                sys.exit(1)
 
-    # unlock / attempts：读状态，改字段，写回
-    state["lock_until"] = 0
-    if mode == "attempts":
-        state["attempts"] = 0
-        print("[成功] 已清 attempts + lock_until")
-    else:
-        print("[成功] 已清 lock_until（unlock 模式）")
-    store.save(state)
+            # tampered → 忽略 mode，直接全清
+            if tampered or mode == "full":
+                store.clear()  # 三副本全清（StateStore 内部已正确定位 verifier.exe 上的 ADS）
+                if tampered:
+                    print("[注意] 检测到状态被篡改，已清空三副本")
+                else:
+                    print("[成功] 已清空三副本状态（full 模式）")
+                return
+
+            # unlock / attempts：读状态，改字段，写回
+            state["lock_until"] = 0
+            if mode == "attempts":
+                state["attempts"] = 0
+                print("[成功] 已清 attempts + lock_until")
+            else:
+                print("[成功] 已清 lock_until（unlock 模式）")
+            store.save(state)
+    except TimeoutError:
+        print("[失败] 状态被其他进程占用，请稍后重试")
+        sys.exit(1)
 
 
 def main() -> None:
